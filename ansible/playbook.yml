@@ -1,0 +1,162 @@
+---
+# Ansible playbook — optional Day-2 operations helper.
+# This is NOT invoked by the CI/CD pipeline; it is provided for
+# manual re-deployment, rolling restarts, and maintenance tasks.
+#
+# Usage:
+#   ansible-playbook -i <ec2-public-ip>, \
+#     -u ec2-user \
+#     --private-key ~/.ssh/<key>.pem \
+#     ansible/playbook.yml \
+#     -e "tf_state_bucket=<bucket> project_name=<name> aws_region=us-east-1 \
+#         db_host=<rds-endpoint> db_port=3306 db_name=<name> \
+#         db_user=<user> db_password=<password>"
+
+- name: Deploy Node.js Express app to EC2
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    app_zip: /tmp/app.zip
+    node_version: "20"
+    aws_region: "us-east-1"
+    tf_state_bucket: ""
+    project_name: ""
+    db_host: ""
+    db_port: "3306"
+    db_name: "appdb"
+    db_user: "appuser"
+    db_password: ""
+    port: "3000"
+    host: "0.0.0.0"
+    node_env: "production"
+
+  tasks:
+    # ── System packages ───────────────────────────────────────────────────────
+    - name: Update all packages
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_cache: true
+
+    - name: Install NodeSource Node.js 20 setup script
+      ansible.builtin.shell: |
+        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+      args:
+        creates: /etc/yum.repos.d/nodesource-el9.repo
+
+    - name: Install Node.js, unzip, aws-cli
+      ansible.builtin.dnf:
+        name:
+          - nodejs
+          - unzip
+          - aws-cli
+        state: present
+
+    - name: Install PM2 globally
+      community.general.npm:
+        name: pm2
+        global: true
+        state: present
+
+    # ── Download artifact ─────────────────────────────────────────────────────
+    - name: Create app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download app.zip from S3
+      ansible.builtin.command: >
+        aws s3 cp
+        s3://{{ tf_state_bucket }}/{{ project_name }}/app.zip
+        {{ app_zip }}
+        --region {{ aws_region }}
+      changed_when: true
+
+    - name: Unzip application
+      ansible.builtin.unarchive:
+        src: "{{ app_zip }}"
+        dest: "{{ app_dir }}"
+        remote_src: true
+
+    - name: Remove zip file
+      ansible.builtin.file:
+        path: "{{ app_zip }}"
+        state: absent
+
+    # ── Node dependencies ─────────────────────────────────────────────────────
+    - name: Install Node.js production dependencies
+      community.general.npm:
+        path: "{{ app_dir }}"
+        production: true
+        state: present
+
+    # ── Environment file ──────────────────────────────────────────────────────
+    - name: Write .env file
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/.env"
+        mode: "0600"
+        content: |
+          DB_HOST={{ db_host }}
+          DB_PORT={{ db_port }}
+          DB_NAME={{ db_name }}
+          DB_USER={{ db_user }}
+          DB_PASSWORD={{ db_password }}
+          PORT={{ port }}
+          HOST={{ host }}
+          NODE_ENV={{ node_env }}
+
+    # ── PM2 process management ────────────────────────────────────────────────
+    - name: Stop existing PM2 app (ignore errors if not running)
+      ansible.builtin.command: pm2 stop app
+      failed_when: false
+      changed_when: false
+
+    - name: Delete existing PM2 app (ignore errors if not present)
+      ansible.builtin.command: pm2 delete app
+      failed_when: false
+      changed_when: false
+
+    - name: Start app with PM2
+      ansible.builtin.command: >
+        pm2 start {{ app_dir }}/server.js
+        --name app
+        --env production
+      args:
+        chdir: "{{ app_dir }}"
+      environment:
+        NODE_ENV: production
+      changed_when: true
+
+    - name: Save PM2 process list
+      ansible.builtin.command: pm2 save
+      changed_when: true
+
+    - name: Configure PM2 to start on system boot
+      ansible.builtin.shell: |
+        pm2 startup systemd -u root --hp /root | tail -1 | bash || true
+      changed_when: false
+
+    - name: Enable PM2 systemd service
+      ansible.builtin.systemd:
+        name: pm2-root
+        enabled: true
+        state: started
+      failed_when: false
+
+    # ── Verification ──────────────────────────────────────────────────────────
+    - name: Wait for app to respond on port 3000
+      ansible.builtin.uri:
+        url: "http://localhost:3000/health"
+        status_code: 200
+        timeout: 10
+      retries: 10
+      delay: 10
+      register: health_check
+
+    - name: Show health check response
+      ansible.builtin.debug:
+        var: health_check.json
