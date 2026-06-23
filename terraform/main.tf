@@ -6,10 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.5"
-    }
   }
 
   backend "s3" {}
@@ -19,7 +15,9 @@ provider "aws" {
   region = var.aws_region
 }
 
-# ─── Variables ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
 
 variable "aws_region" {
   description = "AWS region"
@@ -28,29 +26,29 @@ variable "aws_region" {
 }
 
 variable "project_name" {
-  description = "Project name (used as resource prefix)"
+  description = "Project name used as a prefix for all resources"
   type        = string
 }
 
-variable "tf_state_bucket" {
-  description = "S3 bucket used for Terraform state and app artifacts"
+variable "public_key" {
+  description = "SSH public key material to install on the EC2 instance"
   type        = string
 }
 
 variable "db_name" {
-  description = "MySQL database name"
+  description = "PostgreSQL database name"
   type        = string
   default     = "appdb"
 }
 
-variable "db_user" {
-  description = "MySQL master username"
+variable "db_username" {
+  description = "PostgreSQL master username"
   type        = string
   default     = "appuser"
 }
 
 variable "db_password" {
-  description = "MySQL master password"
+  description = "PostgreSQL master password"
   type        = string
   sensitive   = true
 }
@@ -61,17 +59,9 @@ variable "instance_type" {
   default     = "t3.small"
 }
 
-variable "key_name" {
-  description = "EC2 key pair name (optional)"
-  type        = string
-  default     = ""
-}
-
-# ─── Data sources ─────────────────────────────────────────────────────────────
-
-data "aws_availability_zones" "available" {
-  state = "available"
-}
+# ---------------------------------------------------------------------------
+# Data sources
+# ---------------------------------------------------------------------------
 
 data "aws_ami" "amazon_linux_2023" {
   most_recent = true
@@ -93,12 +83,18 @@ data "aws_ami" "amazon_linux_2023" {
   }
 }
 
-# ─── VPC ──────────────────────────────────────────────────────────────────────
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# ---------------------------------------------------------------------------
+# VPC & Networking
+# ---------------------------------------------------------------------------
 
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
   enable_dns_hostnames = true
+  enable_dns_support   = true
 
   tags = {
     Name    = "${var.project_name}-vpc"
@@ -115,29 +111,36 @@ resource "aws_internet_gateway" "main" {
   }
 }
 
-# Public subnets (ALB)
 resource "aws_subnet" "public" {
-  count                   = 2
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = cidrsubnet("10.0.0.0/16", 8, count.index)
-  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[0]
   map_public_ip_on_launch = true
 
   tags = {
-    Name    = "${var.project_name}-public-${count.index}"
+    Name    = "${var.project_name}-public-subnet"
     Project = var.project_name
   }
 }
 
-# Private subnets (RDS)
-resource "aws_subnet" "private" {
-  count             = 2
+resource "aws_subnet" "private_a" {
   vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet("10.0.0.0/16", 8, count.index + 10)
-  availability_zone = data.aws_availability_zones.available.names[count.index]
+  cidr_block        = "10.0.10.0/24"
+  availability_zone = data.aws_availability_zones.available.names[0]
 
   tags = {
-    Name    = "${var.project_name}-private-${count.index}"
+    Name    = "${var.project_name}-private-subnet-a"
+    Project = var.project_name
+  }
+}
+
+resource "aws_subnet" "private_b" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.11.0/24"
+  availability_zone = data.aws_availability_zones.available.names[1]
+
+  tags = {
+    Name    = "${var.project_name}-private-subnet-b"
     Project = var.project_name
   }
 }
@@ -157,65 +160,32 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table_association" "public" {
-  count          = 2
-  subnet_id      = aws_subnet.public[count.index].id
+  subnet_id      = aws_subnet.public.id
   route_table_id = aws_route_table.public.id
 }
 
-# ─── Security Groups ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Security Groups
+# ---------------------------------------------------------------------------
 
-resource "aws_security_group" "alb" {
-  name        = "${var.project_name}-alb-sg"
-  description = "Allow inbound HTTP/HTTPS from everywhere"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    description = "HTTP from internet"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTPS from internet"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name    = "${var.project_name}-alb-sg"
-    Project = var.project_name
-  }
-}
-
+# EC2 security group: allow SSH (22) and HTTP (80) inbound; port 3000 NOT exposed
 resource "aws_security_group" "ec2" {
   name        = "${var.project_name}-ec2-sg"
-  description = "Allow inbound 3000 from ALB only"
+  description = "EC2 instance security group"
   vpc_id      = aws_vpc.main.id
 
-  ingress {
-    description     = "App port from ALB"
-    from_port       = 3000
-    to_port         = 3000
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
-  }
-
-  # Allow SSH for emergency access if key_name is set
   ingress {
     description = "SSH"
     from_port   = 22
     to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -233,15 +203,16 @@ resource "aws_security_group" "ec2" {
   }
 }
 
+# RDS security group: allow PostgreSQL (5432) only from EC2 SG
 resource "aws_security_group" "rds" {
   name        = "${var.project_name}-rds-sg"
-  description = "Allow MySQL from EC2 only"
+  description = "RDS PostgreSQL security group"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description     = "MySQL from EC2"
-    from_port       = 3306
-    to_port         = 3306
+    description     = "PostgreSQL from EC2"
+    from_port       = 5432
+    to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.ec2.id]
   }
@@ -259,69 +230,50 @@ resource "aws_security_group" "rds" {
   }
 }
 
-# ─── IAM Instance Profile ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SSH Key Pair
+# ---------------------------------------------------------------------------
 
-resource "aws_iam_role" "ec2" {
-  name = "${var.project_name}-ec2-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+resource "aws_key_pair" "deploy" {
+  key_name   = "${var.project_name}-deploy-key"
+  public_key = var.public_key
 
   tags = {
     Project = var.project_name
   }
 }
 
-resource "aws_iam_role_policy" "ec2_s3" {
-  name = "${var.project_name}-ec2-s3-policy"
-  role = aws_iam_role.ec2.id
+# ---------------------------------------------------------------------------
+# EC2 Instance
+# ---------------------------------------------------------------------------
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = "arn:aws:s3:::${var.tf_state_bucket}/${var.project_name}/app.zip"
-      },
-      {
-        # Allow SSM Session Manager access
-        Effect = "Allow"
-        Action = [
-          "ssm:UpdateInstanceInformation",
-          "ssmmessages:CreateControlChannel",
-          "ssmmessages:CreateDataChannel",
-          "ssmmessages:OpenControlChannel",
-          "ssmmessages:OpenDataChannel",
-          "ec2messages:AcknowledgeMessage",
-          "ec2messages:DeleteMessage",
-          "ec2messages:FailMessage",
-          "ec2messages:GetEndpoint",
-          "ec2messages:GetMessages",
-          "ec2messages:SendReply"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
+resource "aws_instance" "app" {
+  ami                         = data.aws_ami.amazon_linux_2023.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.public.id
+  vpc_security_group_ids      = [aws_security_group.ec2.id]
+  key_name                    = aws_key_pair.deploy.key_name
+  associate_public_ip_address = true
+
+  root_block_device {
+    volume_size           = 20
+    volume_type           = "gp3"
+    delete_on_termination = true
+  }
+
+  tags = {
+    Name    = "${var.project_name}-app"
+    Project = var.project_name
+  }
 }
 
-resource "aws_iam_instance_profile" "ec2" {
-  name = "${var.project_name}-ec2-profile"
-  role = aws_iam_role.ec2.name
-}
-
-# ─── RDS MySQL ────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# RDS PostgreSQL
+# ---------------------------------------------------------------------------
 
 resource "aws_db_subnet_group" "main" {
   name       = "${var.project_name}-db-subnet-group"
-  subnet_ids = aws_subnet.private[*].id
+  subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
 
   tags = {
     Name    = "${var.project_name}-db-subnet-group"
@@ -329,132 +281,50 @@ resource "aws_db_subnet_group" "main" {
   }
 }
 
-resource "aws_db_instance" "mysql" {
-  identifier             = "${var.project_name}-mysql"
-  engine                 = "mysql"
-  engine_version         = "8.0"
+resource "aws_db_instance" "postgres" {
+  identifier             = "${var.project_name}-postgres"
+  engine                 = "postgres"
+  engine_version         = "15.7"
   instance_class         = "db.t3.micro"
   allocated_storage      = 20
   storage_type           = "gp2"
+  storage_encrypted      = true
   db_name                = var.db_name
-  username               = var.db_user
+  username               = var.db_username
   password               = var.db_password
   db_subnet_group_name   = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.rds.id]
-  publicly_accessible    = false
   skip_final_snapshot    = true
+  deletion_protection    = false
+  publicly_accessible    = false
   multi_az               = false
 
   tags = {
-    Name    = "${var.project_name}-mysql"
+    Name    = "${var.project_name}-postgres"
     Project = var.project_name
   }
 }
 
-# ─── EC2 Instance ─────────────────────────────────────────────────────────────
-
-resource "aws_instance" "app" {
-  ami                    = data.aws_ami.amazon_linux_2023.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.public[0].id
-  vpc_security_group_ids = [aws_security_group.ec2.id]
-  iam_instance_profile   = aws_iam_instance_profile.ec2.name
-  key_name               = var.key_name != "" ? var.key_name : null
-
-  user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
-    aws_region      = var.aws_region
-    tf_state_bucket = var.tf_state_bucket
-    project_name    = var.project_name
-    db_host         = aws_db_instance.mysql.address
-    db_port         = "3306"
-    db_name         = var.db_name
-    db_user         = var.db_user
-    db_password     = var.db_password
-  }))
-
-  tags = {
-    Name    = "${var.project_name}-app"
-    Project = var.project_name
-  }
-
-  depends_on = [aws_db_instance.mysql]
-}
-
-# ─── Application Load Balancer ────────────────────────────────────────────────
-
-resource "aws_lb" "main" {
-  name               = "${var.project_name}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
-
-  tags = {
-    Name    = "${var.project_name}-alb"
-    Project = var.project_name
-  }
-}
-
-resource "aws_lb_target_group" "app" {
-  name        = "${var.project_name}-tg"
-  port        = 3000
-  protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
-  target_type = "instance"
-
-  health_check {
-    enabled             = true
-    path                = "/health"
-    protocol            = "HTTP"
-    port                = "traffic-port"
-    healthy_threshold   = 2
-    unhealthy_threshold = 5
-    timeout             = 5
-    interval            = 30
-    matcher             = "200-299"
-  }
-
-  tags = {
-    Name    = "${var.project_name}-tg"
-    Project = var.project_name
-  }
-}
-
-resource "aws_lb_target_group_attachment" "app" {
-  target_group_arn = aws_lb_target_group.app.arn
-  target_id        = aws_instance.app.id
-  port             = 3000
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
-  }
-}
-
-# ─── Outputs ──────────────────────────────────────────────────────────────────
-
-output "alb_dns_name" {
-  description = "Public DNS of the Application Load Balancer"
-  value       = aws_lb.main.dns_name
-}
-
-output "rds_endpoint" {
-  description = "RDS MySQL endpoint address"
-  value       = aws_db_instance.mysql.address
-}
-
-output "ec2_instance_id" {
-  description = "EC2 instance ID"
-  value       = aws_instance.app.id
-}
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
 
 output "ec2_public_ip" {
-  description = "EC2 public IP"
+  description = "Public IP of the EC2 instance"
   value       = aws_instance.app.public_ip
+}
+
+output "rds_host" {
+  description = "RDS PostgreSQL endpoint hostname"
+  value       = aws_db_instance.postgres.address
+}
+
+output "rds_port" {
+  description = "RDS PostgreSQL port"
+  value       = aws_db_instance.postgres.port
+}
+
+output "rds_db_name" {
+  description = "RDS database name"
+  value       = aws_db_instance.postgres.db_name
 }

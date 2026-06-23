@@ -1,162 +1,242 @@
 ---
-# Ansible playbook — optional Day-2 operations helper.
-# This is NOT invoked by the CI/CD pipeline; it is provided for
-# manual re-deployment, rolling restarts, and maintenance tasks.
-#
-# Usage:
-#   ansible-playbook -i <ec2-public-ip>, \
-#     -u ec2-user \
-#     --private-key ~/.ssh/<key>.pem \
-#     ansible/playbook.yml \
-#     -e "tf_state_bucket=<bucket> project_name=<name> aws_region=us-east-1 \
-#         db_host=<rds-endpoint> db_port=3306 db_name=<name> \
-#         db_user=<user> db_password=<password>"
-
-- name: Deploy Node.js Express app to EC2
+- name: Configure EC2 and deploy Node.js application
   hosts: all
   become: true
   gather_facts: true
 
   vars:
     app_dir: /opt/app
-    app_zip: /tmp/app.zip
+    app_user: ec2-user
     node_version: "20"
-    aws_region: "us-east-1"
-    tf_state_bucket: ""
-    project_name: ""
+    # These vars are expected to be passed via --extra-vars
     db_host: ""
-    db_port: "3306"
-    db_name: "appdb"
-    db_user: "appuser"
+    db_port: "5432"
+    db_name: ""
+    db_user: ""
     db_password: ""
-    port: "3000"
-    host: "0.0.0.0"
-    node_env: "production"
+    app_archive: "/tmp/app.tar.gz"
 
   tasks:
-    # ── System packages ───────────────────────────────────────────────────────
-    - name: Update all packages
-      ansible.builtin.dnf:
+    # -------------------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------------------
+    - name: Update all system packages
+      dnf:
         name: "*"
         state: latest
-        update_cache: true
+        update_only: true
+      async: 300
+      poll: 10
 
-    - name: Install NodeSource Node.js 20 setup script
-      ansible.builtin.shell: |
-        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-      args:
-        creates: /etc/yum.repos.d/nodesource-el9.repo
-
-    - name: Install Node.js, unzip, aws-cli
-      ansible.builtin.dnf:
+    - name: Install required system packages
+      dnf:
         name:
-          - nodejs
-          - unzip
-          - aws-cli
+          - git
+          - curl
+          - tar
+          - nginx
+          - python3
         state: present
 
+    # -------------------------------------------------------------------------
+    # Node.js 20 via NodeSource
+    # -------------------------------------------------------------------------
+    - name: Check if Node.js 20 is already installed
+      command: node --version
+      register: node_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download NodeSource setup script for Node.js 20
+      get_url:
+        url: https://rpm.nodesource.com/setup_20.x
+        dest: /tmp/nodesource_setup.sh
+        mode: "0755"
+      when: node_check.rc != 0 or not node_check.stdout is search('v20\.')
+
+    - name: Run NodeSource setup script
+      command: bash /tmp/nodesource_setup.sh
+      when: node_check.rc != 0 or not node_check.stdout is search('v20\.')
+
+    - name: Install Node.js 20
+      dnf:
+        name: nodejs
+        state: present
+      when: node_check.rc != 0 or not node_check.stdout is search('v20\.')
+
+    - name: Verify Node.js version
+      command: node --version
+      register: node_version_out
+      changed_when: false
+
+    - name: Display Node.js version
+      debug:
+        msg: "Node.js version: {{ node_version_out.stdout }}"
+
     - name: Install PM2 globally
-      community.general.npm:
+      npm:
         name: pm2
         global: true
         state: present
 
-    # ── Download artifact ─────────────────────────────────────────────────────
-    - name: Create app directory
-      ansible.builtin.file:
+    # -------------------------------------------------------------------------
+    # Application directory
+    # -------------------------------------------------------------------------
+    - name: Create application directory
+      file:
         path: "{{ app_dir }}"
         state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
         mode: "0755"
 
-    - name: Download app.zip from S3
-      ansible.builtin.command: >
-        aws s3 cp
-        s3://{{ tf_state_bucket }}/{{ project_name }}/app.zip
-        {{ app_zip }}
-        --region {{ aws_region }}
-      changed_when: true
+    - name: Check if app archive exists locally on runner
+      stat:
+        path: "{{ app_archive }}"
+      register: archive_stat
+      delegate_to: localhost
+      become: false
 
-    - name: Unzip application
-      ansible.builtin.unarchive:
-        src: "{{ app_zip }}"
+    - name: Copy application archive to server
+      copy:
+        src: "{{ app_archive }}"
+        dest: /tmp/app.tar.gz
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+      when: archive_stat.stat.exists
+
+    - name: Extract application archive
+      unarchive:
+        src: /tmp/app.tar.gz
         dest: "{{ app_dir }}"
         remote_src: true
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
 
-    - name: Remove zip file
-      ansible.builtin.file:
-        path: "{{ app_zip }}"
-        state: absent
-
-    # ── Node dependencies ─────────────────────────────────────────────────────
     - name: Install Node.js production dependencies
-      community.general.npm:
+      npm:
         path: "{{ app_dir }}"
         production: true
         state: present
+      become_user: "{{ app_user }}"
 
-    # ── Environment file ──────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Write .env file via shell (never via copy: with content:)
+    # -------------------------------------------------------------------------
     - name: Write .env file
-      ansible.builtin.copy:
-        dest: "{{ app_dir }}/.env"
-        mode: "0600"
-        content: |
-          DB_HOST={{ db_host }}
-          DB_PORT={{ db_port }}
-          DB_NAME={{ db_name }}
-          DB_USER={{ db_user }}
-          DB_PASSWORD={{ db_password }}
-          PORT={{ port }}
-          HOST={{ host }}
-          NODE_ENV={{ node_env }}
-
-    # ── PM2 process management ────────────────────────────────────────────────
-    - name: Stop existing PM2 app (ignore errors if not running)
-      ansible.builtin.command: pm2 stop app
-      failed_when: false
-      changed_when: false
-
-    - name: Delete existing PM2 app (ignore errors if not present)
-      ansible.builtin.command: pm2 delete app
-      failed_when: false
-      changed_when: false
-
-    - name: Start app with PM2
-      ansible.builtin.command: >
-        pm2 start {{ app_dir }}/server.js
-        --name app
-        --env production
+      shell: |
+        cat > {{ app_dir }}/.env << 'ENVEOF'
+        NODE_ENV=production
+        PORT=3000
+        DB_HOST={{ db_host }}
+        DB_PORT=5432
+        DB_NAME={{ db_name }}
+        DB_USER={{ db_user }}
+        DB_PASSWORD={{ db_password }}
+        ENVEOF
+        chmod 600 {{ app_dir }}/.env
+        chown {{ app_user }}:{{ app_user }} {{ app_dir }}/.env
       args:
-        chdir: "{{ app_dir }}"
-      environment:
-        NODE_ENV: production
-      changed_when: true
+        executable: /bin/bash
+      no_log: true
+
+    # -------------------------------------------------------------------------
+    # PM2 — start/restart the application
+    # -------------------------------------------------------------------------
+    - name: Stop existing PM2 app (if running)
+      shell: |
+        su - {{ app_user }} -c "pm2 stop app 2>/dev/null || true"
+        su - {{ app_user }} -c "pm2 delete app 2>/dev/null || true"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Start application with PM2 using npm start
+      shell: |
+        cd {{ app_dir }}
+        su - {{ app_user }} -c "cd {{ app_dir }} && pm2 start npm --name app -- start --update-env"
+      args:
+        executable: /bin/bash
 
     - name: Save PM2 process list
-      ansible.builtin.command: pm2 save
-      changed_when: true
+      shell: |
+        su - {{ app_user }} -c "pm2 save"
+      args:
+        executable: /bin/bash
 
-    - name: Configure PM2 to start on system boot
-      ansible.builtin.shell: |
-        pm2 startup systemd -u root --hp /root | tail -1 | bash || true
+    - name: Configure PM2 startup on boot
+      shell: |
+        pm2 startup systemd -u {{ app_user }} --hp /home/{{ app_user }}
+        systemctl enable pm2-{{ app_user }}
+      args:
+        executable: /bin/bash
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # Nginx configuration — proxy port 80 -> 127.0.0.1:3000
+    # -------------------------------------------------------------------------
+    - name: Write Nginx configuration
+      shell: |
+        cat > /etc/nginx/conf.d/app.conf << 'NGINXEOF'
+        server {
+            listen 80;
+            server_name _;
+
+            location / {
+                proxy_pass         http://127.0.0.1:3000;
+                proxy_http_version 1.1;
+                proxy_set_header   Upgrade $http_upgrade;
+                proxy_set_header   Connection 'upgrade';
+                proxy_set_header   Host $host;
+                proxy_set_header   X-Real-IP $remote_addr;
+                proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header   X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+                proxy_read_timeout 90s;
+            }
+        }
+        NGINXEOF
+      args:
+        executable: /bin/bash
+
+    - name: Remove default Nginx server block (if present)
+      file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+
+    - name: Validate Nginx configuration
+      command: nginx -t
       changed_when: false
 
-    - name: Enable PM2 systemd service
-      ansible.builtin.systemd:
-        name: pm2-root
+    - name: Enable and start Nginx
+      systemd:
+        name: nginx
         enabled: true
+        state: restarted
+        daemon_reload: true
+
+    # -------------------------------------------------------------------------
+    # Wait for the application to be healthy
+    # -------------------------------------------------------------------------
+    - name: Wait for application to respond on port 3000 (internal)
+      wait_for:
+        host: 127.0.0.1
+        port: 3000
+        delay: 5
+        timeout: 60
         state: started
-      failed_when: false
 
-    # ── Verification ──────────────────────────────────────────────────────────
-    - name: Wait for app to respond on port 3000
-      ansible.builtin.uri:
-        url: "http://localhost:3000/health"
-        status_code: 200
-        timeout: 10
-      retries: 10
+    - name: Verify app health endpoint via Nginx (port 80)
+      uri:
+        url: "http://127.0.0.1:80/health"
+        method: GET
+        status_code: [200, 201, 202, 204]
+        timeout: 15
+      retries: 6
       delay: 10
-      register: health_check
+      register: health_result
 
-    - name: Show health check response
-      ansible.builtin.debug:
-        var: health_check.json
+    - name: Display health check result
+      debug:
+        msg: "Health check response: {{ health_result.status }} — app is running"

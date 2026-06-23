@@ -1,44 +1,23 @@
-name: Destroy Infrastructure
+name: Destroy fytst5
 
 on:
   workflow_dispatch:
-    inputs:
-      confirm_destroy:
-        description: "Type DESTROY to confirm teardown of all resources"
-        required: true
-        default: ""
-
-env:
-  TF_VERSION: "1.7.5"
 
 jobs:
   destroy:
-    name: Terraform Destroy
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.confirm_destroy == 'DESTROY' }}
 
     env:
-      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
-      TF_VAR_tf_state_bucket: ${{ secrets.TF_STATE_BUCKET }}
-      TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
-      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: terraform
@@ -50,10 +29,8 @@ jobs:
 
       - name: Terraform Destroy
         working-directory: terraform
-        run: terraform destroy -auto-approve
-
-      - name: Remove app artifact from S3
-        run: |-
-          aws s3 rm \
-            s3://${{ secrets.TF_STATE_BUCKET }}/${{ secrets.PROJECT_NAME }}/app.zip \
-            --region ${{ secrets.AWS_REGION }} || true
+        run: |
+          terraform destroy -auto-approve \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
